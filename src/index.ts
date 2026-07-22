@@ -6,26 +6,45 @@ import {
   type Message,
   type ThreadChannel,
 } from "discord.js";
+import cron from "node-cron";
+import { loadCohortRegistry } from "./cohorts.js";
 import { config } from "./config.js";
 import {
   closeDatabase,
-  hasProcessedMessage,
-  saveProcessedMessage,
+  getDailyCohortStatus,
+  hasQrEvent,
+  markMisplacedUpload,
+  markMissingAlertSent,
+  markNormalUpload,
+  saveQrEvent,
 } from "./database.js";
 import {
+  getDateKey,
+  getHourInTimeZone,
+  isWeekdayInTimeZone,
+  toCronTime,
+} from "./date.js";
+import {
   cleanDiscordMessageTitle,
+  formatSlackMisplacedQrMessage,
+  formatSlackMissingQrMessage,
   formatSlackQrUploadMessage,
 } from "./formatter.js";
 import {
   findTodayQrParentMessage,
   postSlackThreadReply,
 } from "./slack.js";
+import type { CohortConfig } from "./types.js";
 
 const imageExtensions = [".png", ".jpg", ".jpeg", ".webp", ".gif"];
+const qrTextPattern = /QR\s*코드|QR/i;
 const processingMessages = new Set<string>();
 let isShuttingDown = false;
 
-console.log("[INFO] Starting Discord Slack QR bot");
+console.log("[INFO] Starting CM Safety Bot v2");
+
+const cohortRegistry = loadCohortRegistry();
+const missingCheckCronTime = toCronTime(config.qrMissingCheckTime);
 
 const client = new Client({
   intents: [
@@ -37,9 +56,8 @@ const client = new Client({
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`[INFO] Discord bot logged in as ${readyClient.user.tag}`);
-  console.log(
-    `[INFO] Watching Discord thread messages. threadName=${JSON.stringify(config.discordQrThreadName)}`,
-  );
+  console.log(`[INFO] Loaded active cohorts. count=${cohortRegistry.cohorts.length}`);
+  scheduleMissingUploadCheck();
 });
 
 client.on(Events.Warn, (warning) => {
@@ -56,133 +74,207 @@ client.on(Events.ShardError, (error) => {
 
 client.on(Events.MessageCreate, async (message) => {
   try {
-    if (!message.channel.isThread()) {
-      return;
-    }
-
-    const thread = message.channel;
-
-    console.log("[DEBUG] Discord thread message received");
-    console.log(`threadName=${JSON.stringify(thread.name)}`);
-    console.log(`threadParentId=${JSON.stringify(thread.parentId)}`);
-    console.log(`content=${JSON.stringify(message.content)}`);
-    console.log(`attachmentCount=${message.attachments.size}`);
-
-    const ignoreReason = getQrMessageIgnoreReason(message, thread);
-
-    if (ignoreReason) {
-      console.log(`[DEBUG] QR message ignored. reason=${ignoreReason}`);
-      return;
-    }
-
-    const imageAttachments = getImageAttachments(message);
-    const authorName = message.member?.displayName ?? message.author.username;
-    const cleanTitle = cleanDiscordMessageTitle(message.content);
-    const discordMessageUrl = `https://discord.com/channels/${message.guildId}/${message.channelId}/${message.id}`;
-
-    console.log("[INFO] Discord QR message detected");
-    console.log(`threadName=${JSON.stringify(thread.name)}`);
-    console.log(`threadParentId=${JSON.stringify(thread.parentId)}`);
-    console.log(`threadId=${JSON.stringify(thread.id)}`);
-    console.log(`slackTitle=${JSON.stringify(cleanTitle)}`);
-    console.log(`author=${JSON.stringify(authorName)}`);
-    console.log(`uploadedAt=${message.createdAt.toISOString()}`);
-    console.log(`imageCount=${imageAttachments.length}`);
-
-    if (processingMessages.has(message.id)) {
-      console.log(`[INFO] Discord QR message is already processing. messageId=${message.id}`);
-      return;
-    }
-
-    if (hasProcessedMessage(message.id)) {
-      console.log(`[INFO] Discord QR message already processed. messageId=${message.id}`);
-      return;
-    }
-
-    processingMessages.add(message.id);
-
-    try {
-      const parentMessage = await findTodayQrParentMessage();
-
-      if (!parentMessage) {
-        console.error(
-          `[ERROR] Slack parent message not found for today. cohort=${JSON.stringify(config.cohortName)}`,
-        );
-        return;
-      }
-
-      console.log(`[INFO] Slack parent message found. parentTs=${parentMessage.ts}`);
-
-      const slackText = formatSlackQrUploadMessage({
-        cohortName: config.cohortName,
-        channelName: config.discordQrThreadName,
-        title: cleanTitle,
-        discordMessageUrl,
-        authorName,
-        uploadedAt: message.createdAt,
-        imageCount: imageAttachments.length,
-      });
-
-      const replyTs = await postSlackThreadReply(parentMessage.ts, slackText);
-
-      saveProcessedMessage({
-        discordMessageId: message.id,
-        discordThreadId: thread.id,
-        slackChannelId: config.slackDailyChannelId,
-        slackParentTs: parentMessage.ts,
-        slackReplyTs: replyTs,
-      });
-
-      console.log(`[INFO] Slack thread reply posted successfully. replyTs=${replyTs}`);
-    } finally {
-      processingMessages.delete(message.id);
-    }
+    await handleDiscordMessage(message);
   } catch (error) {
     console.error("[ERROR] Failed to handle Discord messageCreate event", error);
   }
 });
 
-function getQrMessageIgnoreReason(
-  message: Message,
-  thread: ThreadChannel,
-): string | null {
+async function handleDiscordMessage(message: Message): Promise<void> {
+  if (message.author.bot) {
+    return;
+  }
+
   if (message.guildId !== config.discordGuildId) {
-    return "guild_id_mismatch";
+    return;
   }
 
-  if (thread.parentId !== config.discordQrParentChannelId) {
-    return "parent_channel_id_mismatch";
+  if (!cohortRegistry.registeredManagerIds.has(message.author.id)) {
+    return;
   }
 
-  if (thread.name !== config.discordQrThreadName) {
-    return "thread_name_mismatch";
+  const imageAttachments = getImageAttachments(message);
+
+  if (imageAttachments.length === 0) {
+    return;
   }
 
-  if (!hasDateText(message.content)) {
-    return "date_text_not_found";
+  if (!qrTextPattern.test(message.content)) {
+    return;
   }
 
-  if (!hasQrCodeText(message.content)) {
-    return "qr_code_text_not_found";
+  if (processingMessages.has(message.id)) {
+    console.log(`[INFO] Discord QR message is already processing. messageId=${message.id}`);
+    return;
   }
 
-  if (getImageAttachments(message).length === 0) {
-    return "image_attachment_not_found";
+  if (hasQrEvent(message.id)) {
+    console.log(`[INFO] Discord QR message already processed. messageId=${message.id}`);
+    return;
   }
 
-  return null;
+  processingMessages.add(message.id);
+
+  try {
+    const managerCohorts = cohortRegistry.cohortsByManagerId.get(message.author.id) ?? [];
+    const normalCohort = managerCohorts.find((cohort) => isCorrectLocation(message, cohort));
+
+    if (normalCohort) {
+      await handleNormalUpload(message, normalCohort, imageAttachments.length);
+      return;
+    }
+
+    if (!isWithinMisplacedMonitorWindow(new Date())) {
+      console.log(`[INFO] QR candidate ignored outside misplaced monitor window. messageId=${message.id}`);
+      return;
+    }
+
+    const misplacedCohort = resolveMisplacedCohort(message, managerCohorts);
+
+    if (misplacedCohort) {
+      await handleMisplacedUpload(message, misplacedCohort, imageAttachments.length);
+    }
+  } finally {
+    processingMessages.delete(message.id);
+  }
 }
 
-function hasDateText(content: string): boolean {
-  return (
-    /\d{1,2}\s*월\s*\d{1,2}\s*일/.test(content) ||
-    /\d{1,2}\s*[/.]\s*\d{1,2}/.test(content) ||
-    /\d{4}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,2}/.test(content)
+async function handleNormalUpload(
+  message: Message,
+  cohort: CohortConfig,
+  imageCount: number,
+): Promise<void> {
+  const cleanTitle = cleanDiscordMessageTitle(message.content);
+  const discordMessageUrl = getDiscordMessageUrl(message);
+  const authorName = getDisplayAuthorName(message);
+  const parentMessage = await findTodayQrParentMessage(cohort);
+
+  if (!parentMessage) {
+    console.error(
+      `[ERROR] Slack parent message not found for today. cohort=${JSON.stringify(cohort.cohortName)}`,
+    );
+    return;
+  }
+
+  const slackText = formatSlackQrUploadMessage({
+    cohortName: cohort.cohortName,
+    channelName: cohort.discordThreadName,
+    title: cleanTitle,
+    discordMessageUrl,
+    authorName,
+    uploadedAt: message.createdAt,
+    imageCount,
+  });
+
+  const replyTs = await postSlackThreadReply(parentMessage.ts, slackText);
+
+  saveQrEvent({
+    discordMessageId: message.id,
+    discordChannelId: message.channelId,
+    discordThreadId: message.channel.isThread() ? message.channel.id : null,
+    discordAuthorId: message.author.id,
+    cohortId: cohort.id,
+    eventType: "normal",
+    messageTitle: cleanTitle,
+    discordMessageUrl,
+    imageCount,
+    slackChannelId: config.slackDailyChannelId,
+    slackParentTs: parentMessage.ts,
+    slackReplyTs: replyTs,
+    discordCreatedAt: message.createdAt,
+  });
+
+  markNormalUpload(getDateKey(message.createdAt, config.timezone), cohort.id, message.id);
+
+  console.log(
+    `[INFO] Normal QR upload reported. cohort=${JSON.stringify(cohort.cohortName)} replyTs=${replyTs}`,
   );
 }
 
-function hasQrCodeText(content: string): boolean {
-  return /QR\s*코드/i.test(content);
+async function handleMisplacedUpload(
+  message: Message,
+  cohort: CohortConfig,
+  imageCount: number,
+): Promise<void> {
+  const cleanTitle = cleanDiscordMessageTitle(message.content);
+  const discordMessageUrl = getDiscordMessageUrl(message);
+  const authorName = getDisplayAuthorName(message);
+  const parentMessage = await findTodayQrParentMessage(cohort);
+
+  if (!parentMessage) {
+    console.error(
+      `[ERROR] Slack parent message not found for misplaced QR. cohort=${JSON.stringify(cohort.cohortName)}`,
+    );
+    return;
+  }
+
+  const slackText = formatSlackMisplacedQrMessage({
+    cohortName: cohort.cohortName,
+    channelName: cohort.discordThreadName,
+    title: cleanTitle,
+    discordMessageUrl,
+    authorName,
+    uploadedAt: message.createdAt,
+    imageCount,
+    actualLocation: getDiscordLocationLabel(message),
+    expectedLocation: getExpectedLocationLabel(cohort),
+  });
+
+  const replyTs = await postSlackThreadReply(parentMessage.ts, slackText);
+
+  saveQrEvent({
+    discordMessageId: message.id,
+    discordChannelId: message.channelId,
+    discordThreadId: message.channel.isThread() ? message.channel.id : null,
+    discordAuthorId: message.author.id,
+    cohortId: cohort.id,
+    eventType: "misplaced",
+    messageTitle: cleanTitle,
+    discordMessageUrl,
+    imageCount,
+    slackChannelId: config.slackDailyChannelId,
+    slackParentTs: parentMessage.ts,
+    slackReplyTs: replyTs,
+    discordCreatedAt: message.createdAt,
+  });
+
+  markMisplacedUpload(getDateKey(message.createdAt, config.timezone), cohort.id);
+
+  console.log(
+    `[WARN] Misplaced QR upload reported. cohort=${JSON.stringify(cohort.cohortName)} replyTs=${replyTs}`,
+  );
+}
+
+function resolveMisplacedCohort(
+  message: Message,
+  managerCohorts: CohortConfig[],
+): CohortConfig | null {
+  if (managerCohorts.length === 0) {
+    return null;
+  }
+
+  if (message.channel.isThread() && message.channel.parentId) {
+    const actualCohort = cohortRegistry.cohortByParentChannelId.get(message.channel.parentId);
+
+    if (actualCohort && managerCohorts.some((cohort) => cohort.id === actualCohort.id)) {
+      return actualCohort;
+    }
+  }
+
+  return managerCohorts[0] ?? null;
+}
+
+function isCorrectLocation(message: Message, cohort: CohortConfig): boolean {
+  return (
+    message.channel.isThread() &&
+    message.channel.parentId === cohort.discordParentChannelId &&
+    message.channel.name === cohort.discordThreadName
+  );
+}
+
+function isWithinMisplacedMonitorWindow(date: Date): boolean {
+  const hour = getHourInTimeZone(date, config.timezone);
+  return hour >= config.qrMonitorStartHour && hour < config.qrMonitorEndHour;
 }
 
 function getImageAttachments(message: Message): Attachment[] {
@@ -196,6 +288,98 @@ function isImageAttachment(attachment: Attachment): boolean {
 
   const filename = attachment.name?.toLowerCase() ?? "";
   return imageExtensions.some((extension) => filename.endsWith(extension));
+}
+
+function getDisplayAuthorName(message: Message): string {
+  return message.member?.displayName ?? message.author.globalName ?? message.author.username;
+}
+
+function getDiscordMessageUrl(message: Message): string {
+  return `https://discord.com/channels/${message.guildId}/${message.channelId}/${message.id}`;
+}
+
+function getDiscordLocationLabel(message: Message): string {
+  if (message.channel.isThread()) {
+    return `${message.channel.parent?.name ?? "알 수 없는 채널"} → ${message.channel.name}`;
+  }
+
+  if ("name" in message.channel && message.channel.name) {
+    return message.channel.name;
+  }
+
+  return message.channelId ?? "알 수 없는 채널";
+}
+
+function getExpectedLocationLabel(cohort: CohortConfig): string {
+  return `${cohort.discordParentChannelId} → ${cohort.discordThreadName}`;
+}
+
+function scheduleMissingUploadCheck(): void {
+  cron.schedule(
+    `${missingCheckCronTime.minute} ${missingCheckCronTime.hour} * * 1-5`,
+    () => {
+      void runMissingUploadCheck(new Date());
+    },
+    {
+      timezone: config.timezone,
+    },
+  );
+
+  console.log(`[INFO] Scheduled missing QR check. time=${config.qrMissingCheckTime}`);
+}
+
+async function runMissingUploadCheck(now: Date): Promise<void> {
+  if (!isWeekdayInTimeZone(now, config.timezone)) {
+    return;
+  }
+
+  const statusDate = getDateKey(now, config.timezone);
+
+  for (const cohort of cohortRegistry.cohorts) {
+    const status = getDailyCohortStatus(statusDate, cohort.id);
+
+    if (status.normalUploadDetected || status.missingAlertSent) {
+      continue;
+    }
+
+    const parentMessage = await findTodayQrParentMessage(cohort);
+
+    if (!parentMessage) {
+      console.error(
+        `[ERROR] Slack parent message not found for missing QR alert. cohort=${JSON.stringify(cohort.cohortName)}`,
+      );
+      continue;
+    }
+
+    const slackText = formatSlackMissingQrMessage({
+      cohortName: cohort.cohortName,
+      checkedAt: now,
+      expectedLocation: getExpectedLocationLabel(cohort),
+    });
+
+    const replyTs = await postSlackThreadReply(parentMessage.ts, slackText);
+
+    saveQrEvent({
+      discordMessageId: null,
+      discordChannelId: null,
+      discordThreadId: null,
+      discordAuthorId: null,
+      cohortId: cohort.id,
+      eventType: "missing",
+      messageTitle: null,
+      discordMessageUrl: null,
+      imageCount: 0,
+      slackChannelId: config.slackDailyChannelId,
+      slackParentTs: parentMessage.ts,
+      slackReplyTs: replyTs,
+      discordCreatedAt: null,
+    });
+
+    markMissingAlertSent(statusDate, cohort.id);
+    console.log(
+      `[WARN] Missing QR upload alert posted. cohort=${JSON.stringify(cohort.cohortName)} replyTs=${replyTs}`,
+    );
+  }
 }
 
 console.log("[INFO] Logging in to Discord");
