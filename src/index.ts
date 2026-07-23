@@ -92,12 +92,27 @@ async function handleDiscordMessage(message: Message): Promise<void> {
   }
 
   const imageAttachments = getImageAttachments(message);
+  const hasQrText = qrTextPattern.test(message.content);
+
+  if (message.attachments.size > 0 || hasQrText) {
+    console.log("[DEBUG] Discord QR candidate check");
+    console.log(`authorId=${message.author.id}`);
+    console.log(`author=${JSON.stringify(getDisplayAuthorName(message))}`);
+    console.log(`location=${JSON.stringify(getDiscordLocationLabel(message))}`);
+    console.log(`content=${JSON.stringify(message.content)}`);
+    console.log(`attachmentCount=${message.attachments.size}`);
+    console.log(`imageCount=${imageAttachments.length}`);
+  }
 
   if (imageAttachments.length === 0) {
+    if (message.attachments.size > 0 || hasQrText) {
+      console.log("[DEBUG] QR candidate ignored. reason=image_attachment_not_found");
+    }
     return;
   }
 
-  if (!qrTextPattern.test(message.content)) {
+  if (!hasQrText) {
+    console.log("[DEBUG] QR candidate ignored. reason=qr_text_not_found");
     return;
   }
 
@@ -138,7 +153,10 @@ async function handleDiscordMessage(message: Message): Promise<void> {
 
     if (misplacedCohort) {
       await handleMisplacedUpload(message, misplacedCohort, imageAttachments.length);
+      return;
     }
+
+    console.log(`[DEBUG] QR candidate ignored. reason=no_matching_cohort messageId=${message.id}`);
   } finally {
     processingMessages.delete(message.id);
   }
