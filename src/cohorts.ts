@@ -13,7 +13,14 @@ export type CohortRegistry = {
 export function loadCohortRegistry(): CohortRegistry {
   const configPath = resolve(config.cohortsConfigPath);
   const parsed = JSON.parse(readFileSync(configPath, "utf8")) as CohortConfig[];
-  const cohorts = parsed.filter((cohort) => cohort.active);
+  const cohorts = parsed
+    .filter((cohort) => cohort.active)
+    .map((cohort) => ({
+      ...cohort,
+      discordParentChannelId: String(cohort.discordParentChannelId),
+      discordParentChannelName: String(cohort.discordParentChannelName),
+      managerIds: cohort.managerIds.map(String),
+    }));
 
   if (cohorts.length === 0) {
     throw new Error("At least one active cohort is required");

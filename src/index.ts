@@ -89,10 +89,6 @@ async function handleDiscordMessage(message: Message): Promise<void> {
     return;
   }
 
-  if (!cohortRegistry.registeredManagerIds.has(message.author.id)) {
-    return;
-  }
-
   const imageAttachments = getImageAttachments(message);
 
   if (imageAttachments.length === 0) {
@@ -100,6 +96,13 @@ async function handleDiscordMessage(message: Message): Promise<void> {
   }
 
   if (!qrTextPattern.test(message.content)) {
+    return;
+  }
+
+  if (!cohortRegistry.registeredManagerIds.has(message.author.id)) {
+    console.log(
+      `[DEBUG] QR candidate ignored because author is not registered. authorId=${message.author.id} author=${JSON.stringify(getDisplayAuthorName(message))}`,
+    );
     return;
   }
 
@@ -311,7 +314,7 @@ function getDiscordLocationLabel(message: Message): string {
 }
 
 function getExpectedLocationLabel(cohort: CohortConfig): string {
-  return `${cohort.discordParentChannelId} → ${cohort.discordThreadName}`;
+  return `${cohort.discordParentChannelName} → ${cohort.discordThreadName}`;
 }
 
 function scheduleMissingUploadCheck(): void {

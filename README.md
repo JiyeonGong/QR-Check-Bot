@@ -23,7 +23,7 @@ DISCORD_GUILD_ID=
 SLACK_BOT_TOKEN=
 SLACK_DAILY_CHANNEL_ID=
 
-COHORTS_CONFIG_PATH=./config/cohorts.json
+COHORTS_CONFIG_PATH=./config/cohorts.local.json
 TIMEZONE=Asia/Seoul
 DATABASE_PATH=./data/bot.db
 QR_MONITOR_START_HOUR=7
@@ -32,13 +32,20 @@ QR_MISSING_CHECK_TIME=08:50
 LOG_LEVEL=info
 ```
 
-과정별 Discord 채널과 CM ID는 `config/cohorts.json`에서 관리합니다.
+과정별 Discord 채널과 CM ID는 `config/cohorts.local.json`에서 관리합니다. 이 파일은 Git에 커밋하지 않습니다.
+
+처음 설정할 때는 `config/cohorts.json` 예시를 복사해 로컬 파일을 만듭니다.
+
+```bash
+cp config/cohorts.json config/cohorts.local.json
+```
 
 ```json
 {
   "id": "pd-22",
   "cohortName": "PD_22기",
   "discordParentChannelId": "부모 텍스트 채널 ID",
+  "discordParentChannelName": "PD_22기",
   "discordThreadName": "📢 출결 QR 스캔 안내",
   "managerIds": ["Discord CM user ID"],
   "slackParentMessageKeyword": "[PD_22기]",
@@ -46,7 +53,7 @@ LOG_LEVEL=info
 }
 ```
 
-정식 적용 시에는 `.env`와 `config/cohorts.json`만 교체하는 것을 목표로 합니다.
+정식 적용 시에는 `.env`와 `config/cohorts.local.json`만 교체하는 것을 목표로 합니다.
 
 ## 실행
 

@@ -2,6 +2,7 @@ export type CohortConfig = {
   id: string;
   cohortName: string;
   discordParentChannelId: string;
+  discordParentChannelName: string;
   discordThreadName: string;
   managerIds: string[];
   slackParentMessageKeyword: string;
