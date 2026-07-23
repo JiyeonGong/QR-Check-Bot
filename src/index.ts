@@ -21,6 +21,7 @@ import {
 import {
   getDateKey,
   getHourInTimeZone,
+  isAtOrAfterTimeInTimeZone,
   isWeekdayInTimeZone,
   toCronTime,
 } from "./date.js";
@@ -58,6 +59,7 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`[INFO] Discord bot logged in as ${readyClient.user.tag}`);
   console.log(`[INFO] Loaded active cohorts. count=${cohortRegistry.cohorts.length}`);
   scheduleMissingUploadCheck();
+  void runStartupMissingUploadCheck(new Date());
 });
 
 client.on(Events.Warn, (warning) => {
@@ -329,6 +331,19 @@ function scheduleMissingUploadCheck(): void {
   );
 
   console.log(`[INFO] Scheduled missing QR check. time=${config.qrMissingCheckTime}`);
+}
+
+async function runStartupMissingUploadCheck(now: Date): Promise<void> {
+  if (!isWeekdayInTimeZone(now, config.timezone)) {
+    return;
+  }
+
+  if (!isAtOrAfterTimeInTimeZone(now, config.timezone, missingCheckCronTime)) {
+    return;
+  }
+
+  console.log("[INFO] Running startup missing QR check because scheduled time has already passed");
+  await runMissingUploadCheck(now);
 }
 
 async function runMissingUploadCheck(now: Date): Promise<void> {
