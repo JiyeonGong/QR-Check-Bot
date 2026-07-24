@@ -1,6 +1,7 @@
 import { WebClient } from "@slack/web-api";
 import { config } from "./config.js";
 import { isTodayInTimeZone } from "./date.js";
+import type { CohortConfig } from "./types.js";
 
 const slack = new WebClient(config.slackBotToken);
 
@@ -9,7 +10,9 @@ type SlackParentMessage = {
   text: string;
 };
 
-export async function findTodayQrParentMessage(): Promise<SlackParentMessage | null> {
+export async function findTodayQrParentMessage(
+  cohort: CohortConfig,
+): Promise<SlackParentMessage | null> {
   const response = await slack.conversations.history({
     channel: config.slackDailyChannelId,
     limit: 100,
@@ -30,7 +33,7 @@ export async function findTodayQrParentMessage(): Promise<SlackParentMessage | n
 
     return (
       isTodayInTimeZone(messageDate, config.timezone) &&
-      message.text.includes(`[${config.cohortName}]`) &&
+      message.text.includes(cohort.slackParentMessageKeyword) &&
       /QR\s*코드/i.test(message.text)
     );
   });
